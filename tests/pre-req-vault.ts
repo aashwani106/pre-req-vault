@@ -3,11 +3,12 @@ import { Program } from "@anchor-lang/core";
 import { PreReqVault } from "../target/types/pre_req_vault";
 import {
   Commitment,
+  Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
   SystemProgram,
+  Transaction,
 } from "@solana/web3.js";
-import NodeWallet from "@anchor-lang/core/dist/cjs/nodewallet";
 import { BN } from "bn.js";
 import { expect } from "chai";
 
@@ -24,7 +25,7 @@ describe("pre-req-vault", () => {
         signature,
         ...latestBlockhash,
       },
-      commitement,
+      commitement
     );
   };
 
@@ -32,27 +33,51 @@ describe("pre-req-vault", () => {
   anchor.setProvider(provider);
 
   const program = anchor.workspace.preReqVault as Program<PreReqVault>;
-  const user = provider.wallet.publicKey;
+  const userKeypair = Keypair.generate();
+  const user = userKeypair.publicKey;
+  const github = "aashwani106";
 
   // Derive PDAs
 
   const [vaultStatePda, stateBump] = PublicKey.findProgramAddressSync(
     [Buffer.from("state"), user.toBuffer()],
-    program.programId,
+    program.programId
   );
 
   const [vaultPda, vaultBump] = PublicKey.findProgramAddressSync(
     [Buffer.from("vault"), vaultStatePda.toBuffer()],
-    program.programId,
+    program.programId
   );
 
-  //   before(async () => {
-  //     const sig = await provider.connection.requestAirdrop(
-  //       user,
-  //       10 * LAMPORTS_PER_SOL,
-  //     );
-  //     await confirmTx(sig);
-  //   });
+  before(async () => {
+    const fundingTx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: provider.wallet.publicKey,
+        toPubkey: user,
+        lamports: 2 * LAMPORTS_PER_SOL,
+      })
+    );
+
+    const signature = await provider.sendAndConfirm(fundingTx);
+    console.log(`Fund test wallet: ${signature}`);
+  });
+
+  after(async () => {
+    const remainingBalance = await provider.connection.getBalance(user);
+
+    if (remainingBalance > 0) {
+      const cleanupTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: user,
+          toPubkey: provider.wallet.publicKey,
+          lamports: remainingBalance,
+        })
+      );
+
+      const signature = await provider.sendAndConfirm(cleanupTx, [userKeypair]);
+      console.log(`Reclaim test wallet: ${signature}`);
+    }
+  });
 
   it("Initialize the vault", async () => {
     const tx = await program.methods
@@ -63,6 +88,7 @@ describe("pre-req-vault", () => {
         vault: vaultPda,
         systemProgram: SystemProgram.programId,
       })
+      .signers([userKeypair])
       .rpc();
 
     await confirmTx(tx);
@@ -86,15 +112,16 @@ describe("pre-req-vault", () => {
         vault: vaultPda,
         systemProgram: SystemProgram.programId,
       })
+      .signers([userKeypair])
       .rpc();
 
-    confirmTx(tx);
+    await confirmTx(tx);
 
     const finalBalanceVault = await provider.connection.getBalance(vaultPda);
     const finalBalanceUser = await provider.connection.getBalance(user);
 
     expect(finalBalanceVault).to.equal(initialVaultBalance + depositAmount);
-    expect(finalBalanceUser).to.be.lessThan(intialUserBalance - depositAmount);
+    expect(finalBalanceUser).to.equal(intialUserBalance - depositAmount);
   });
 
   it(" Withdraw 0.5 Sol from the vault", async () => {
@@ -104,16 +131,17 @@ describe("pre-req-vault", () => {
     const intialUserBalance = await provider.connection.getBalance(user);
 
     const applicationProgram = new PublicKey(
-      "TRBZyQHB3m68FGeVsqTK39Wm4xejadjVhP5MAZaKWDM",
+      "TRBZyQHB3m68FGeVsqTK39Wm4xejadjVhP5MAZaKWDM"
     );
 
-    const applicationAccount = PublicKey.findProgramAddressSync(
-      [Buffer.from("prereqs"), user.toBuffer()],
-      applicationProgram,
-    )[0];
+    const [applicationAccount, applicationBump] =
+      PublicKey.findProgramAddressSync(
+        [Buffer.from("prereqs"), user.toBuffer()],
+        applicationProgram
+      );
 
     const tx = await program.methods
-      .withdraw(new BN(withdrawAmount))
+      .withdraw(new BN(withdrawAmount), github)
       .accountsStrict({
         user: user,
         vaultState: vaultStatePda,
@@ -122,15 +150,39 @@ describe("pre-req-vault", () => {
         applicationAccount,
         applicationProgram,
       })
+      .signers([userKeypair])
       .rpc();
 
-    confirmTx(tx);
+    await confirmTx(tx);
 
     const finalBalanceVault = await provider.connection.getBalance(vaultPda);
     const finalBalanceUser = await provider.connection.getBalance(user);
+    const applicationAccountInfo = await provider.connection.getAccountInfo(
+      applicationAccount
+    );
 
     expect(finalBalanceVault).to.equal(initialVaultBalance - withdrawAmount);
     expect(finalBalanceUser).to.be.greaterThan(intialUserBalance);
+    expect(applicationAccountInfo).to.not.be.null;
+    expect(applicationAccountInfo!.owner.equals(applicationProgram)).to.be.true;
+
+    const applicationData = applicationAccountInfo!.data;
+    const applicationDiscriminator = Buffer.from([
+      222, 181, 17, 200, 212, 149, 64, 88,
+    ]);
+    expect(applicationData.subarray(0, 8).equals(applicationDiscriminator)).to
+      .be.true;
+
+    const storedUser = new PublicKey(applicationData.subarray(8, 40));
+    const storedBump = applicationData[40];
+    const githubLength = applicationData.readUInt32LE(43);
+    const storedGithub = applicationData
+      .subarray(47, 47 + githubLength)
+      .toString("utf8");
+
+    expect(storedUser.equals(user)).to.be.true;
+    expect(storedBump).to.equal(applicationBump);
+    expect(storedGithub).to.equal(github);
   });
 
   it(" Close the vault and withdraw all the funds", async () => {
@@ -144,14 +196,15 @@ describe("pre-req-vault", () => {
         vault: vaultPda,
         systemProgram: SystemProgram.programId,
       })
+      .signers([userKeypair])
       .rpc();
 
-    confirmTx(tx);
+    await confirmTx(tx);
 
     expect(await provider.connection.getBalance(vaultPda)).to.equal(0);
 
     const vaultStateInfo = await provider.connection.getAccountInfo(
-      vaultStatePda,
+      vaultStatePda
     );
     expect(vaultStateInfo).to.be.null;
 
